@@ -475,6 +475,29 @@ impl FastPrp {
     pub fn cache_size_bytes(&self) -> usize {
         self.cache.size_bytes()
     }
+
+    /// Access the counter cache (for serialization / persistence).
+    pub fn counter_cache(&self) -> &CounterCache {
+        &self.cache
+    }
+
+    /// Access the partition cache (for serialization / persistence).
+    pub fn partition_cache(&self) -> &PartitionCache {
+        &self.pcache
+    }
+
+    /// Reconstruct a FastPrp from a key, domain size, and pre-built caches.
+    ///
+    /// The BitstringGen is deterministic from (key, n) and needs no persistence.
+    /// Use this with caches obtained from `counter_cache()` / `partition_cache()`
+    /// and reconstructed via `CounterCache::from_raw()` / `PartitionCache::from_raw()`.
+    pub fn from_parts(key: &[u8; 16], n: u64, cache: CounterCache, pcache: PartitionCache) -> Self {
+        assert!(n >= 2, "domain size must be at least 2");
+        let gen = BitstringGen::new(key, n);
+        let max_depth = (16.0 * (n as f64).ln()).ceil() as u32;
+        let max_depth = max_depth.max(64);
+        Self { gen, cache, pcache, n, max_depth }
+    }
 }
 
 #[cfg(test)]

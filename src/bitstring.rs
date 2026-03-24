@@ -167,165 +167,224 @@ impl BitstringGen {
         count - self.count_ones_range(d, start, count)
     }
 
+    /// Extract the position of the k-th set bit (1-indexed) from a masked u128.
+    #[inline]
+    fn extract_kth_set_bit(mut masked: u128, k: u64) -> u32 {
+        for _ in 1..k {
+            masked &= masked - 1; // clear lowest set bit
+        }
+        masked.trailing_zeros()
+    }
+
     /// Find the index of the k-th one bit (1-indexed) in β_d starting from position `start`.
     /// Returns the offset relative to `start`.
+    /// Uses 8-way pipelined AES for the block scan.
     pub fn find_kth_one(&self, d: u32, start: u64, k: u64) -> u64 {
         debug_assert!(k >= 1);
         let mut remaining = k;
-        let mut pos = start;
         let global_base = (d as u64) * self.n;
+        let global_start = global_base + start;
+        let first_block = global_start / 128;
+        let first_bit_offset = (global_start % 128) as u32;
 
-        loop {
-            let global_pos = global_base + pos;
-            let block_idx = global_pos / 128;
-            let bit_offset = (global_pos % 128) as u32;
-
-            let block = self.aes_block(block_idx);
-            let masked = if bit_offset > 0 {
-                block & (u128::MAX << bit_offset)
-            } else {
-                block
-            };
-            let ones_in_block = masked.count_ones() as u64;
-
-            if ones_in_block >= remaining {
-                let mut b = masked;
-                for _ in 1..remaining {
-                    b &= b - 1; // clear lowest set bit
-                }
-                let bit_pos = b.trailing_zeros() as u64;
-                return (block_idx * 128 + bit_pos) - global_base - start;
+        // Handle first partial block.
+        let mut blk = first_block;
+        if first_bit_offset > 0 {
+            let block = self.aes_block(blk);
+            let masked = block & (u128::MAX << first_bit_offset);
+            let ones = masked.count_ones() as u64;
+            if ones >= remaining {
+                let bit_pos = Self::extract_kth_set_bit(masked, remaining) as u64;
+                return blk * 128 + bit_pos - global_base - start;
             }
+            remaining -= ones;
+            blk += 1;
+        }
 
-            remaining -= ones_in_block;
-            pos = (block_idx + 1) * 128 - global_base;
+        // Process full blocks in batches of 8 for AES pipelining.
+        loop {
+            let vals = self.aes_blocks_8([blk, blk+1, blk+2, blk+3, blk+4, blk+5, blk+6, blk+7]);
+            for i in 0..8u64 {
+                let ones = vals[i as usize].count_ones() as u64;
+                if ones >= remaining {
+                    let bit_pos = Self::extract_kth_set_bit(vals[i as usize], remaining) as u64;
+                    return (blk + i) * 128 + bit_pos - global_base - start;
+                }
+                remaining -= ones;
+            }
+            blk += 8;
         }
     }
 
     /// Find the index of the k-th zero bit (1-indexed) in β_d starting from position `start`.
     /// Returns the offset relative to `start`.
+    /// Uses 8-way pipelined AES for the block scan.
     pub fn find_kth_zero(&self, d: u32, start: u64, k: u64) -> u64 {
         debug_assert!(k >= 1);
         let mut remaining = k;
-        let mut pos = start;
         let global_base = (d as u64) * self.n;
+        let global_start = global_base + start;
+        let first_block = global_start / 128;
+        let first_bit_offset = (global_start % 128) as u32;
+
+        let mut blk = first_block;
+        if first_bit_offset > 0 {
+            let block = self.aes_block(blk);
+            let masked = !block & (u128::MAX << first_bit_offset);
+            let zeros = masked.count_ones() as u64;
+            if zeros >= remaining {
+                let bit_pos = Self::extract_kth_set_bit(masked, remaining) as u64;
+                return blk * 128 + bit_pos - global_base - start;
+            }
+            remaining -= zeros;
+            blk += 1;
+        }
 
         loop {
-            let global_pos = global_base + pos;
-            let block_idx = global_pos / 128;
-            let bit_offset = (global_pos % 128) as u32;
-
-            let block = self.aes_block(block_idx);
-            let inverted = !block;
-            let masked = if bit_offset > 0 {
-                inverted & (u128::MAX << bit_offset)
-            } else {
-                inverted
-            };
-            let zeros_in_block = masked.count_ones() as u64;
-
-            if zeros_in_block >= remaining {
-                let mut b = masked;
-                for _ in 1..remaining {
-                    b &= b - 1;
+            let vals = self.aes_blocks_8([blk, blk+1, blk+2, blk+3, blk+4, blk+5, blk+6, blk+7]);
+            for i in 0..8u64 {
+                let inv = !vals[i as usize];
+                let zeros = inv.count_ones() as u64;
+                if zeros >= remaining {
+                    let bit_pos = Self::extract_kth_set_bit(inv, remaining) as u64;
+                    return (blk + i) * 128 + bit_pos - global_base - start;
                 }
-                let bit_pos = b.trailing_zeros() as u64;
-                return (block_idx * 128 + bit_pos) - global_base - start;
+                remaining -= zeros;
             }
-
-            remaining -= zeros_in_block;
-            pos = (block_idx + 1) * 128 - global_base;
+            blk += 8;
         }
     }
 
     /// Find the k-th one bit FROM THE END (1-indexed from right) in β_d[start..start+len).
     /// Returns the offset relative to `start`.
+    /// Uses 8-way pipelined AES for the block scan.
     pub fn find_kth_one_from_end(&self, d: u32, start: u64, len: u64, k: u64) -> u64 {
         debug_assert!(k >= 1);
         let mut remaining = k;
         let global_base = (d as u64) * self.n;
         let global_start = global_base + start;
         let global_end = global_start + len;
-        let mut scan_end = global_end;
+        let last_block = (global_end - 1) / 128;
+        let first_block = global_start / 128;
 
-        loop {
-            let block_idx = (scan_end - 1) / 128;
-            let block_start = block_idx * 128;
-            let block = self.aes_block(block_idx);
-
-            let lo_bit = if block_start < global_start {
-                (global_start - block_start) as u32
-            } else {
-                0
-            };
-            let hi_bit = ((scan_end - block_start).min(128)) as u32;
-
-            let mask = {
-                let upper = if hi_bit >= 128 { u128::MAX } else { (1u128 << hi_bit) - 1 };
-                if lo_bit == 0 { upper } else { upper & (u128::MAX << lo_bit) }
-            };
-
+        // Handle last partial block.
+        let hi_bit = (global_end % 128) as u32;
+        let mut blk = last_block;
+        if hi_bit != 0 {
+            let block = self.aes_block(blk);
+            let lo_bit = if blk * 128 < global_start { (global_start - blk * 128) as u32 } else { 0 };
+            let mask = ((1u128 << hi_bit) - 1) & if lo_bit == 0 { u128::MAX } else { u128::MAX << lo_bit };
             let masked = block & mask;
             let ones = masked.count_ones() as u64;
-
             if ones >= remaining {
-                // Want the remaining-th one from the right = (ones - remaining + 1)-th from left.
                 let from_left = ones - remaining + 1;
-                let mut b = masked;
-                for _ in 1..from_left {
-                    b &= b - 1; // clear lowest set bit
-                }
-                let bit_pos = b.trailing_zeros() as u64;
-                return block_start + bit_pos - global_base - start;
+                let bit_pos = Self::extract_kth_set_bit(masked, from_left) as u64;
+                return blk * 128 + bit_pos - global_base - start;
             }
-
             remaining -= ones;
-            scan_end = block_start;
+            if blk == first_block { panic!("find_kth_one_from_end: not enough ones"); }
+            blk -= 1;
+        } else {
+            // global_end is block-aligned, start from last_block itself
+        }
+
+        // Process full blocks in batches of 8, scanning right-to-left.
+        loop {
+            if blk >= 7 && blk - 7 >= first_block {
+                let b = blk - 7;
+                let vals = self.aes_blocks_8([b, b+1, b+2, b+3, b+4, b+5, b+6, b+7]);
+                // Check right-to-left
+                for i in (0..8u64).rev() {
+                    let ones = vals[i as usize].count_ones() as u64;
+                    if ones >= remaining {
+                        let from_left = ones - remaining + 1;
+                        let bit_pos = Self::extract_kth_set_bit(vals[i as usize], from_left) as u64;
+                        return (b + i) * 128 + bit_pos - global_base - start;
+                    }
+                    remaining -= ones;
+                }
+                blk -= 8;
+            } else {
+                // Remaining blocks one at a time
+                loop {
+                    let block = self.aes_block(blk);
+                    let lo_bit = if blk * 128 < global_start { (global_start - blk * 128) as u32 } else { 0 };
+                    let masked = if lo_bit == 0 { block } else { block & (u128::MAX << lo_bit) };
+                    let ones = masked.count_ones() as u64;
+                    if ones >= remaining {
+                        let from_left = ones - remaining + 1;
+                        let bit_pos = Self::extract_kth_set_bit(masked, from_left) as u64;
+                        return blk * 128 + bit_pos - global_base - start;
+                    }
+                    remaining -= ones;
+                    if blk == first_block { panic!("find_kth_one_from_end: not enough ones"); }
+                    blk -= 1;
+                }
+            }
         }
     }
 
     /// Find the k-th zero bit FROM THE END (1-indexed from right) in β_d[start..start+len).
     /// Returns the offset relative to `start`.
+    /// Uses 8-way pipelined AES for the block scan.
     pub fn find_kth_zero_from_end(&self, d: u32, start: u64, len: u64, k: u64) -> u64 {
         debug_assert!(k >= 1);
         let mut remaining = k;
         let global_base = (d as u64) * self.n;
         let global_start = global_base + start;
         let global_end = global_start + len;
-        let mut scan_end = global_end;
+        let last_block = (global_end - 1) / 128;
+        let first_block = global_start / 128;
 
-        loop {
-            let block_idx = (scan_end - 1) / 128;
-            let block_start = block_idx * 128;
-            let block = self.aes_block(block_idx);
-
-            let lo_bit = if block_start < global_start {
-                (global_start - block_start) as u32
-            } else {
-                0
-            };
-            let hi_bit = ((scan_end - block_start).min(128)) as u32;
-
-            let mask = {
-                let upper = if hi_bit >= 128 { u128::MAX } else { (1u128 << hi_bit) - 1 };
-                if lo_bit == 0 { upper } else { upper & (u128::MAX << lo_bit) }
-            };
-
+        let hi_bit = (global_end % 128) as u32;
+        let mut blk = last_block;
+        if hi_bit != 0 {
+            let block = self.aes_block(blk);
+            let lo_bit = if blk * 128 < global_start { (global_start - blk * 128) as u32 } else { 0 };
+            let mask = ((1u128 << hi_bit) - 1) & if lo_bit == 0 { u128::MAX } else { u128::MAX << lo_bit };
             let masked = !block & mask;
             let zeros = masked.count_ones() as u64;
-
             if zeros >= remaining {
                 let from_left = zeros - remaining + 1;
-                let mut b = masked;
-                for _ in 1..from_left {
-                    b &= b - 1;
-                }
-                let bit_pos = b.trailing_zeros() as u64;
-                return block_start + bit_pos - global_base - start;
+                let bit_pos = Self::extract_kth_set_bit(masked, from_left) as u64;
+                return blk * 128 + bit_pos - global_base - start;
             }
-
             remaining -= zeros;
-            scan_end = block_start;
+            if blk == first_block { panic!("find_kth_zero_from_end: not enough zeros"); }
+            blk -= 1;
+        }
+
+        loop {
+            if blk >= 7 && blk - 7 >= first_block {
+                let b = blk - 7;
+                let vals = self.aes_blocks_8([b, b+1, b+2, b+3, b+4, b+5, b+6, b+7]);
+                for i in (0..8u64).rev() {
+                    let inv = !vals[i as usize];
+                    let zeros = inv.count_ones() as u64;
+                    if zeros >= remaining {
+                        let from_left = zeros - remaining + 1;
+                        let bit_pos = Self::extract_kth_set_bit(inv, from_left) as u64;
+                        return (b + i) * 128 + bit_pos - global_base - start;
+                    }
+                    remaining -= zeros;
+                }
+                blk -= 8;
+            } else {
+                loop {
+                    let block = self.aes_block(blk);
+                    let lo_bit = if blk * 128 < global_start { (global_start - blk * 128) as u32 } else { 0 };
+                    let masked = if lo_bit == 0 { !block } else { !block & (u128::MAX << lo_bit) };
+                    let zeros = masked.count_ones() as u64;
+                    if zeros >= remaining {
+                        let from_left = zeros - remaining + 1;
+                        let bit_pos = Self::extract_kth_set_bit(masked, from_left) as u64;
+                        return blk * 128 + bit_pos - global_base - start;
+                    }
+                    remaining -= zeros;
+                    if blk == first_block { panic!("find_kth_zero_from_end: not enough zeros"); }
+                    blk -= 1;
+                }
+            }
         }
     }
 

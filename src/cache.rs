@@ -15,6 +15,16 @@ pub struct PartitionCache {
 }
 
 impl PartitionCache {
+    /// Reconstruct a PartitionCache from previously extracted raw data.
+    pub fn from_raw(depths: Vec<Vec<(u64, u32)>>) -> Self {
+        Self { depths }
+    }
+
+    /// Access the raw partition boundary data for serialization.
+    pub fn raw_depths(&self) -> &Vec<Vec<(u64, u32)>> {
+        &self.depths
+    }
+
     /// Build by simulating the partition tree (boundary tracking only, no element shuffling).
     pub fn new(gen: &BitstringGen, n: u64, num_depths: u32) -> Self {
         let mut depths: Vec<Vec<(u64, u32)>> = Vec::new();
@@ -158,6 +168,18 @@ impl CounterCache {
             return 0; // Fall back to uncached
         }
         self.cache[d as usize][i] as u64
+    }
+
+    /// Reconstruct a CounterCache from previously extracted raw data.
+    ///
+    /// Use with `raw_cache()` for cache persistence.
+    pub fn from_raw(stride: u64, num_depths: u32, n: u64, cache: Vec<Vec<u32>>) -> Self {
+        Self { stride, num_depths, n, cache }
+    }
+
+    /// Access the raw cached counters for serialization.
+    pub fn raw_cache(&self) -> &Vec<Vec<u32>> {
+        &self.cache
     }
 
     /// Total cache memory usage in bytes.
