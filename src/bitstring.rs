@@ -238,6 +238,97 @@ impl BitstringGen {
         }
     }
 
+    /// Find the k-th one bit FROM THE END (1-indexed from right) in β_d[start..start+len).
+    /// Returns the offset relative to `start`.
+    pub fn find_kth_one_from_end(&self, d: u32, start: u64, len: u64, k: u64) -> u64 {
+        debug_assert!(k >= 1);
+        let mut remaining = k;
+        let global_base = (d as u64) * self.n;
+        let global_start = global_base + start;
+        let global_end = global_start + len;
+        let mut scan_end = global_end;
+
+        loop {
+            let block_idx = (scan_end - 1) / 128;
+            let block_start = block_idx * 128;
+            let block = self.aes_block(block_idx);
+
+            let lo_bit = if block_start < global_start {
+                (global_start - block_start) as u32
+            } else {
+                0
+            };
+            let hi_bit = ((scan_end - block_start).min(128)) as u32;
+
+            let mask = {
+                let upper = if hi_bit >= 128 { u128::MAX } else { (1u128 << hi_bit) - 1 };
+                if lo_bit == 0 { upper } else { upper & (u128::MAX << lo_bit) }
+            };
+
+            let masked = block & mask;
+            let ones = masked.count_ones() as u64;
+
+            if ones >= remaining {
+                // Want the remaining-th one from the right = (ones - remaining + 1)-th from left.
+                let from_left = ones - remaining + 1;
+                let mut b = masked;
+                for _ in 1..from_left {
+                    b &= b - 1; // clear lowest set bit
+                }
+                let bit_pos = b.trailing_zeros() as u64;
+                return block_start + bit_pos - global_base - start;
+            }
+
+            remaining -= ones;
+            scan_end = block_start;
+        }
+    }
+
+    /// Find the k-th zero bit FROM THE END (1-indexed from right) in β_d[start..start+len).
+    /// Returns the offset relative to `start`.
+    pub fn find_kth_zero_from_end(&self, d: u32, start: u64, len: u64, k: u64) -> u64 {
+        debug_assert!(k >= 1);
+        let mut remaining = k;
+        let global_base = (d as u64) * self.n;
+        let global_start = global_base + start;
+        let global_end = global_start + len;
+        let mut scan_end = global_end;
+
+        loop {
+            let block_idx = (scan_end - 1) / 128;
+            let block_start = block_idx * 128;
+            let block = self.aes_block(block_idx);
+
+            let lo_bit = if block_start < global_start {
+                (global_start - block_start) as u32
+            } else {
+                0
+            };
+            let hi_bit = ((scan_end - block_start).min(128)) as u32;
+
+            let mask = {
+                let upper = if hi_bit >= 128 { u128::MAX } else { (1u128 << hi_bit) - 1 };
+                if lo_bit == 0 { upper } else { upper & (u128::MAX << lo_bit) }
+            };
+
+            let masked = !block & mask;
+            let zeros = masked.count_ones() as u64;
+
+            if zeros >= remaining {
+                let from_left = zeros - remaining + 1;
+                let mut b = masked;
+                for _ in 1..from_left {
+                    b &= b - 1;
+                }
+                let bit_pos = b.trailing_zeros() as u64;
+                return block_start + bit_pos - global_base - start;
+            }
+
+            remaining -= zeros;
+            scan_end = block_start;
+        }
+    }
+
     /// Generate AES blocks covering β_d[start..start+count] into a reusable buffer.
     /// Uses `encrypt_blocks` for AES pipelining.
     /// Returns the first AES block index (base_block).

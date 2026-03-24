@@ -126,7 +126,11 @@ impl FastPrp {
         self.unpermute_rec(y, 0, self.n, 0)
     }
 
-    /// Recursive inverse permutation (Figure 3 + Section 4.2 counter alignment).
+    /// Recursive inverse permutation (Figure 3 + Sections 4.1/4.2).
+    ///
+    /// Uses partition cache for O(1) c0_len, and passes the pre-known
+    /// ones_before_alpha into c0_inv/c1_inv to avoid recomputing it.
+    /// The inner scan is bidirectional (Section 4.1).
     fn unpermute_rec(&self, y: u64, alpha: u64, len: u64, d: u32) -> u64 {
         if len <= 1 {
             return 0;
@@ -136,18 +140,34 @@ impl FastPrp {
             return y;
         }
 
-        // c0(alpha, len): O(1) from partition cache when available.
-        let c0 = self.pcache.c0(d, alpha, len)
-            .unwrap_or_else(|| self.cache.c0(&self.gen, d, alpha, len));
+        // Try partition cache for both c0 and the ones_before_alpha hint.
+        match self.pcache.cumulative_ones(d, alpha) {
+            Some(c1_alpha) => {
+                let c1_end = self.pcache.cumulative_ones(d, alpha + len).unwrap();
+                let c0 = len - (c1_end - c1_alpha);
 
-        if y < c0 {
-            let x_prime = self.unpermute_rec(y, alpha, c0, d + 1);
-            self.cache.c0_inv(&self.gen, d, alpha, x_prime + 1)
-        } else {
-            let y_prime = y - c0;
-            let c1 = len - c0;
-            let x_prime = self.unpermute_rec(y_prime, alpha + c0, c1, d + 1);
-            self.cache.c1_inv(&self.gen, d, alpha, x_prime + 1)
+                if y < c0 {
+                    let x_prime = self.unpermute_rec(y, alpha, c0, d + 1);
+                    self.cache.c0_inv_hint(&self.gen, d, alpha, x_prime + 1, c1_alpha)
+                } else {
+                    let y_prime = y - c0;
+                    let c1 = len - c0;
+                    let x_prime = self.unpermute_rec(y_prime, alpha + c0, c1, d + 1);
+                    self.cache.c1_inv_hint(&self.gen, d, alpha, x_prime + 1, c1_alpha)
+                }
+            }
+            None => {
+                let c0 = self.cache.c0(&self.gen, d, alpha, len);
+                if y < c0 {
+                    let x_prime = self.unpermute_rec(y, alpha, c0, d + 1);
+                    self.cache.c0_inv(&self.gen, d, alpha, x_prime + 1)
+                } else {
+                    let y_prime = y - c0;
+                    let c1 = len - c0;
+                    let x_prime = self.unpermute_rec(y_prime, alpha + c0, c1, d + 1);
+                    self.cache.c1_inv(&self.gen, d, alpha, x_prime + 1)
+                }
+            }
         }
     }
 

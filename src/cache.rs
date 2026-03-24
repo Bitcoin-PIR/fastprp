@@ -248,64 +248,90 @@ impl CounterCache {
     }
 
     /// Find the k-th one bit (1-indexed) in β_d starting at position `alpha`.
-    /// Uses binary search over cached values for efficiency.
+    /// Uses binary search + bidirectional scan within the stride block.
     pub fn c1_inv(&self, gen: &BitstringGen, d: u32, alpha: u64, k: u64) -> u64 {
         if !self.is_depth_cached(d) || k == 0 {
             return gen.find_kth_one(d, alpha, k);
         }
-
-        let s = self.stride;
         let ones_before_alpha = self.cumulative_ones(gen, d, alpha);
+        self.c1_inv_inner(gen, d, alpha, k, ones_before_alpha)
+    }
+
+    /// Like `c1_inv` but with pre-known `ones_before_alpha` (avoids 1 scan).
+    pub fn c1_inv_hint(&self, gen: &BitstringGen, d: u32, alpha: u64, k: u64, ones_before_alpha: u64) -> u64 {
+        if !self.is_depth_cached(d) || k == 0 {
+            return gen.find_kth_one(d, alpha, k);
+        }
+        self.c1_inv_inner(gen, d, alpha, k, ones_before_alpha)
+    }
+
+    fn c1_inv_inner(&self, gen: &BitstringGen, d: u32, alpha: u64, k: u64, ones_before_alpha: u64) -> u64 {
+        let s = self.stride;
         let target = ones_before_alpha + k;
+        let cache_d = &self.cache[d as usize];
 
-        // Binary search in cache for the stride containing the target-th one
-        let cache_len = self.cache[d as usize].len();
+        // Binary search for the stride block containing the target-th one.
         let mut lo = 0usize;
-        let mut hi = cache_len;
-
+        let mut hi = cache_d.len();
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if (self.cache[d as usize][mid] as u64) < target {
+            if (cache_d[mid] as u64) < target {
                 lo = mid + 1;
             } else {
                 hi = mid;
             }
         }
 
-        // The target-th one bit is in stride block `lo`
         let block_start = (lo as u64) * s;
-        let ones_at_block_start = if lo > 0 {
-            self.cache[d as usize][lo - 1] as u64
-        } else {
-            0
-        };
-        let remaining = target - ones_at_block_start;
+        let ones_at_start = if lo > 0 { cache_d[lo - 1] as u64 } else { 0 };
+        let remaining_fwd = target - ones_at_start;
 
-        // Linear scan within this stride block
-        let offset = gen.find_kth_one(d, block_start, remaining);
+        // Bidirectional: if within cached range, pick shorter direction.
+        if lo < cache_d.len() {
+            let ones_at_end = cache_d[lo] as u64;
+            let total_ones = ones_at_end - ones_at_start;
+            let remaining_rev = total_ones - remaining_fwd + 1;
+            if remaining_rev < remaining_fwd {
+                let offset = gen.find_kth_one_from_end(d, block_start, s, remaining_rev);
+                return block_start + offset - alpha;
+            }
+        }
+
+        let offset = gen.find_kth_one(d, block_start, remaining_fwd);
         block_start + offset - alpha
     }
 
     /// Find the k-th zero bit (1-indexed) in β_d starting at position `alpha`.
+    /// Uses binary search + bidirectional scan within the stride block.
     pub fn c0_inv(&self, gen: &BitstringGen, d: u32, alpha: u64, k: u64) -> u64 {
         if !self.is_depth_cached(d) || k == 0 {
             return gen.find_kth_zero(d, alpha, k);
         }
+        let ones_before_alpha = self.cumulative_ones(gen, d, alpha);
+        self.c0_inv_inner(gen, d, alpha, k, ones_before_alpha)
+    }
 
+    /// Like `c0_inv` but with pre-known `ones_before_alpha` (avoids 1 scan).
+    pub fn c0_inv_hint(&self, gen: &BitstringGen, d: u32, alpha: u64, k: u64, ones_before_alpha: u64) -> u64 {
+        if !self.is_depth_cached(d) || k == 0 {
+            return gen.find_kth_zero(d, alpha, k);
+        }
+        self.c0_inv_inner(gen, d, alpha, k, ones_before_alpha)
+    }
+
+    fn c0_inv_inner(&self, gen: &BitstringGen, d: u32, alpha: u64, k: u64, ones_before_alpha: u64) -> u64 {
         let s = self.stride;
-        let zeros_before_alpha = alpha - self.cumulative_ones(gen, d, alpha);
+        let zeros_before_alpha = alpha - ones_before_alpha;
         let target_zeros = zeros_before_alpha + k;
+        let cache_d = &self.cache[d as usize];
 
-        // Binary search: find the stride block where the target-th zero is
-        let cache_len = self.cache[d as usize].len();
+        // Binary search for the stride block containing the target-th zero.
         let mut lo = 0usize;
-        let mut hi = cache_len;
-
+        let mut hi = cache_d.len();
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let total_bits = ((mid + 1) as u64) * s;
-            let ones = self.cache[d as usize][mid] as u64;
-            let zeros = total_bits - ones;
+            let zeros = total_bits - cache_d[mid] as u64;
             if zeros < target_zeros {
                 lo = mid + 1;
             } else {
@@ -314,16 +340,22 @@ impl CounterCache {
         }
 
         let block_start = (lo as u64) * s;
-        let zeros_at_block_start = if lo > 0 {
-            let total_bits = (lo as u64) * s;
-            let ones = self.cache[d as usize][lo - 1] as u64;
-            total_bits - ones
-        } else {
-            0
-        };
-        let remaining = target_zeros - zeros_at_block_start;
+        let ones_at_start = if lo > 0 { cache_d[lo - 1] as u64 } else { 0 };
+        let zeros_at_start = block_start - ones_at_start;
+        let remaining_fwd = target_zeros - zeros_at_start;
 
-        let offset = gen.find_kth_zero(d, block_start, remaining);
+        // Bidirectional: if within cached range, pick shorter direction.
+        if lo < cache_d.len() {
+            let ones_at_end = cache_d[lo] as u64;
+            let total_zeros = s - (ones_at_end - ones_at_start);
+            let remaining_rev = total_zeros - remaining_fwd + 1;
+            if remaining_rev < remaining_fwd {
+                let offset = gen.find_kth_zero_from_end(d, block_start, s, remaining_rev);
+                return block_start + offset - alpha;
+            }
+        }
+
+        let offset = gen.find_kth_zero(d, block_start, remaining_fwd);
         block_start + offset - alpha
     }
 }
