@@ -187,6 +187,64 @@ impl CounterCache {
         self.cache.iter().map(|v| v.len() * 4).sum()
     }
 
+    /// Halve the cache stride by computing midpoint counters.
+    ///
+    /// Each midpoint requires scanning only `stride/2` bits (one call to
+    /// `count_ones_range`). This is the incremental caching from Section 5.3.
+    ///
+    /// Example: a cache at stride 1000 has entries at positions
+    /// {1000, 2000, 3000, ...}. After `refine()`, the stride is 500 and
+    /// entries are at {500, 1000, 1500, 2000, ...}. The even entries came
+    /// from the old cache; the odd entries were computed by scanning 500
+    /// bits each.
+    pub fn refine(&mut self, gen: &BitstringGen) {
+        let old_s = self.stride;
+        let new_s = old_s / 2;
+        if new_s < 1 { return; }
+
+        let new_count = (self.n / new_s) as usize;
+
+        for d in 0..self.num_depths as usize {
+            let old = &self.cache[d];
+            let mut refined = Vec::with_capacity(new_count);
+
+            for i in 0..new_count {
+                let pos = (i as u64 + 1) * new_s;
+
+                if pos % old_s == 0 {
+                    // Existing entry from old cache.
+                    let old_i = (pos / old_s - 1) as usize;
+                    refined.push(old[old_i]);
+                } else {
+                    // Midpoint: previous old boundary + scan new_s bits.
+                    let prev_old_pos = (pos / old_s) * old_s;
+                    let prev_c1 = if prev_old_pos == 0 {
+                        0u64
+                    } else {
+                        old[(prev_old_pos / old_s - 1) as usize] as u64
+                    };
+                    let scan = gen.count_ones_range(d as u32, prev_old_pos, new_s);
+                    refined.push((prev_c1 + scan) as u32);
+                }
+            }
+
+            self.cache[d] = refined;
+        }
+
+        self.stride = new_s;
+    }
+
+    /// Refine repeatedly until the stride is at most `target_stride`.
+    /// Returns the number of refinement steps performed.
+    pub fn refine_to(&mut self, gen: &BitstringGen, target_stride: u64) -> u32 {
+        let mut steps = 0u32;
+        while self.stride > target_stride && self.stride >= 2 {
+            self.refine(gen);
+            steps += 1;
+        }
+        steps
+    }
+
     /// Check if depth d is cached.
     #[inline]
     pub fn is_depth_cached(&self, d: u32) -> bool {
@@ -451,6 +509,79 @@ mod tests {
                 let cached = cache.c0_inv(&gen, d, 0, k);
                 assert_eq!(raw, cached, "d={d} k={k}");
             }
+        }
+    }
+
+    #[test]
+    fn test_refine_matches_direct() {
+        // A cache refined from stride 128 → 64 should match one built directly at 64.
+        let key = [42u8; 16];
+        let n = 1024u64;
+        let gen = BitstringGen::new(&key, n);
+
+        let direct = CounterCache::new(&gen, 64);
+
+        let mut refined = CounterCache::new(&gen, 128);
+        refined.refine(&gen);
+
+        assert_eq!(refined.stride, 64);
+        for d in 0..direct.num_depths.min(refined.num_depths) {
+            let dc = &direct.cache[d as usize];
+            let rc = &refined.cache[d as usize];
+            let len = dc.len().min(rc.len());
+            for i in 0..len {
+                assert_eq!(dc[i], rc[i], "d={d} i={i} stride=64");
+            }
+        }
+    }
+
+    #[test]
+    fn test_refine_to_matches_direct() {
+        let key = [99u8; 16];
+        let n = 2048u64;
+        let gen = BitstringGen::new(&key, n);
+
+        // Build at stride 256, refine down to 32.
+        let mut refined = CounterCache::new(&gen, 256);
+        let steps = refined.refine_to(&gen, 32);
+        assert_eq!(steps, 3); // 256→128→64→32
+        assert_eq!(refined.stride, 32);
+
+        let direct = CounterCache::new(&gen, 32);
+
+        for d in 0..direct.num_depths.min(refined.num_depths) {
+            let dc = &direct.cache[d as usize];
+            let rc = &refined.cache[d as usize];
+            let len = dc.len().min(rc.len());
+            for i in 0..len {
+                assert_eq!(dc[i], rc[i], "d={d} i={i}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_refined_cache_permute_roundtrip() {
+        // Build FastPrp with a refined cache and verify permute/unpermute still work.
+        use crate::FastPrp;
+
+        let key = [77u8; 16];
+        let n = 512u64;
+
+        // Direct build.
+        let prp_direct = FastPrp::new(&key, n);
+
+        // Build with coarse cache, refine, reconstruct.
+        let gen = BitstringGen::new(&key, n);
+        let mut cache = CounterCache::new(&gen, 128);
+        cache.refine_to(&gen, 32);
+        let pcache = PartitionCache::new(&gen, n, cache.num_depths);
+        let prp_refined = FastPrp::from_parts(&key, n, cache, pcache);
+
+        for x in 0..n {
+            let y_d = prp_direct.permute(x);
+            let y_r = prp_refined.permute(x);
+            assert_eq!(y_d, y_r, "permute mismatch at x={x}");
+            assert_eq!(prp_refined.unpermute(y_r), x, "roundtrip failed at x={x}");
         }
     }
 }
