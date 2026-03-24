@@ -5,8 +5,17 @@ edition = "2021"
 description = "Fast Pseudo-Random Permutations for Small Domains (Stefanov & Shi 2012)"
 license = "MIT"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 aes = "0.8"
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }
+
+[features]
+default = []
+wasm = ["wasm-bindgen", "js-sys"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
