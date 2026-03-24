@@ -1,5 +1,102 @@
 use crate::bitstring::BitstringGen;
 
+/// Partition-boundary cache (Section 4.2: Counter Alignment).
+///
+/// At each depth d, stores cumulative C1(β_d, 0, pos) at every partition
+/// boundary position. This makes C0(β_d, alpha, len) a pure O(1) lookup
+/// when both alpha and alpha+len are partition boundaries — which they
+/// always are in the permute/unpermute recursion.
+///
+/// Also provides cumulative_ones(d, alpha) so that the stride cache only
+/// needs one scan (for alpha+x) instead of three.
+pub struct PartitionCache {
+    /// For each depth: sorted Vec of (position, cumulative_C1_from_0_to_pos).
+    depths: Vec<Vec<(u64, u32)>>,
+}
+
+impl PartitionCache {
+    /// Build by simulating the partition tree (boundary tracking only, no element shuffling).
+    pub fn new(gen: &BitstringGen, n: u64, num_depths: u32) -> Self {
+        let mut depths: Vec<Vec<(u64, u32)>> = Vec::new();
+        let mut partitions: Vec<(u64, u64)> = vec![(0, n)];
+
+        for d in 0..num_depths {
+            if partitions.iter().all(|&(_, l)| l <= 1) {
+                break;
+            }
+
+            // Boundaries are contiguous: [alpha_0, alpha_1, ..., alpha_k, N].
+            // Scan β_d left-to-right, accumulating C1 at each boundary.
+            let num_bounds = partitions.len() + 1;
+            let mut entries: Vec<(u64, u32)> = Vec::with_capacity(num_bounds);
+
+            let mut prev_pos = 0u64;
+            let mut cum_c1 = 0u32;
+
+            for &(alpha, _) in &partitions {
+                if alpha > prev_pos {
+                    cum_c1 += gen.count_ones_range(d, prev_pos, alpha - prev_pos) as u32;
+                }
+                entries.push((alpha, cum_c1));
+                prev_pos = alpha;
+            }
+            // Final boundary at N.
+            let &(last_a, last_l) = partitions.last().unwrap();
+            let end = last_a + last_l;
+            if end > prev_pos {
+                cum_c1 += gen.count_ones_range(d, prev_pos, end - prev_pos) as u32;
+            }
+            entries.push((end, cum_c1));
+
+            // Split partitions for depth d+1.
+            let mut new_partitions: Vec<(u64, u64)> =
+                Vec::with_capacity(partitions.len() * 2);
+
+            for (i, &(alpha, len)) in partitions.iter().enumerate() {
+                if len <= 1 {
+                    new_partitions.push((alpha, len));
+                    continue;
+                }
+                let c1 = (entries[i + 1].1 - entries[i].1) as u64;
+                let c0 = len - c1;
+                if c0 > 0 { new_partitions.push((alpha, c0)); }
+                if c1 > 0 { new_partitions.push((alpha + c0, c1)); }
+            }
+
+            depths.push(entries);
+            partitions = new_partitions;
+        }
+
+        Self { depths }
+    }
+
+    /// Look up cumulative C1(β_d, 0, pos). Returns None if pos is not a boundary.
+    #[inline]
+    pub fn cumulative_ones(&self, d: u32, pos: u64) -> Option<u64> {
+        let d = d as usize;
+        if d >= self.depths.len() { return None; }
+        let entries = &self.depths[d];
+        match entries.binary_search_by_key(&pos, |&(p, _)| p) {
+            Ok(i) => Some(entries[i].1 as u64),
+            Err(_) => None,
+        }
+    }
+
+    /// Compute C0(β_d, alpha, len) from cached boundaries. O(1).
+    /// Returns None if alpha or alpha+len is not a cached boundary.
+    #[inline]
+    pub fn c0(&self, d: u32, alpha: u64, len: u64) -> Option<u64> {
+        let c1_a = self.cumulative_ones(d, alpha)?;
+        let c1_e = self.cumulative_ones(d, alpha + len)?;
+        Some(len - (c1_e - c1_a))
+    }
+
+    /// Total memory in bytes.
+    pub fn size_bytes(&self) -> usize {
+        self.depths.iter().map(|v| v.len() * 12).sum()
+    }
+}
+
 /// Cached counters for efficient C1 computation.
 ///
 /// Stores C1(β_d, 0, s*i) for each depth d and stride index i,
@@ -72,6 +169,29 @@ impl CounterCache {
     #[inline]
     pub fn is_depth_cached(&self, d: u32) -> bool {
         d < self.num_depths && !self.cache[d as usize].is_empty()
+    }
+
+    /// Compute cumulative C1(β_d, 0, pos) using the stride cache + remainder scan.
+    /// Used when the partition cache provides c1_alpha but we still need c1(alpha+x).
+    #[inline]
+    pub fn cumulative_ones(&self, gen: &BitstringGen, d: u32, pos: u64) -> u64 {
+        if pos == 0 { return 0; }
+        if !self.is_depth_cached(d) {
+            return gen.count_ones_range(d, 0, pos);
+        }
+        let s = self.stride;
+        let full = pos / s;
+        let cached = if full > 0 {
+            self.get_cached(d, (full - 1) as usize)
+        } else {
+            0
+        };
+        let rem_start = full * s;
+        if rem_start < pos {
+            cached + gen.count_ones_range(d, rem_start, pos - rem_start)
+        } else {
+            cached
+        }
     }
 
     /// Compute C1(β_d, α, count) using cached values.

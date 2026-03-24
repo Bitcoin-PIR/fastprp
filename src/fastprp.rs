@@ -1,5 +1,5 @@
 use crate::bitstring::BitstringGen;
-use crate::cache::CounterCache;
+use crate::cache::{CounterCache, PartitionCache};
 
 /// FastPRP: Fast Pseudo-Random Permutation for small domains.
 ///
@@ -9,6 +9,7 @@ use crate::cache::CounterCache;
 pub struct FastPrp {
     gen: BitstringGen,
     cache: CounterCache,
+    pcache: PartitionCache,
     n: u64,
     max_depth: u32,
 }
@@ -32,9 +33,13 @@ impl FastPrp {
         let max_depth = (16.0 * (n as f64).ln()).ceil() as u32;
         let max_depth = max_depth.max(64);
 
+        // Partition-boundary cache (Section 4.2): covers same depths as stride cache.
+        let pcache = PartitionCache::new(&gen, n, cache.num_depths);
+
         Self {
             gen,
             cache,
+            pcache,
             n,
             max_depth,
         }
@@ -50,9 +55,12 @@ impl FastPrp {
         let max_depth = (16.0 * (n as f64).ln()).ceil() as u32;
         let max_depth = max_depth.max(64);
 
+        let pcache = PartitionCache::new(&gen, n, cache.num_depths);
+
         Self {
             gen,
             cache,
+            pcache,
             n,
             max_depth,
         }
@@ -66,7 +74,13 @@ impl FastPrp {
         self.permute_rec(x, 0, self.n, 0)
     }
 
-    /// Recursive permutation (Figure 2 from the paper).
+    /// Recursive permutation (Figure 2 + Section 4.2 counter alignment).
+    ///
+    /// When the partition cache has boundaries for depth d:
+    ///   - c0_len = O(1) from partition cache (both alpha and alpha+len are boundaries)
+    ///   - c1(0, alpha) = O(1) from partition cache
+    ///   - c1(0, alpha+x) = 1 stride-cache scan
+    /// Total: **1 scan** per depth instead of 3.
     fn permute_rec(&self, x: u64, alpha: u64, len: u64, d: u32) -> u64 {
         if len <= 1 {
             return alpha;
@@ -77,7 +91,21 @@ impl FastPrp {
         }
 
         let bit = self.gen.get_bit(d, alpha + x);
-        let (c0_x, c0_len) = self.cache.c0_pair(&self.gen, d, alpha, x, len);
+
+        let (c0_x, c0_len) = match self.pcache.cumulative_ones(d, alpha) {
+            Some(c1_alpha) => {
+                // Partition cache hit: c0_len is free, c0_x needs 1 scan.
+                let c1_end = self.pcache.cumulative_ones(d, alpha + len).unwrap();
+                let c0_len = len - (c1_end - c1_alpha);
+                let c1_at_ax = self.cache.cumulative_ones(&self.gen, d, alpha + x);
+                let c0_x = x - (c1_at_ax - c1_alpha);
+                (c0_x, c0_len)
+            }
+            None => {
+                // Beyond partition cache depth — fall back to stride cache.
+                self.cache.c0_pair(&self.gen, d, alpha, x, len)
+            }
+        };
 
         if bit == 0 {
             if c0_len == 0 { return alpha; }
@@ -98,7 +126,7 @@ impl FastPrp {
         self.unpermute_rec(y, 0, self.n, 0)
     }
 
-    /// Recursive inverse permutation (Figure 3 from the paper).
+    /// Recursive inverse permutation (Figure 3 + Section 4.2 counter alignment).
     fn unpermute_rec(&self, y: u64, alpha: u64, len: u64, d: u32) -> u64 {
         if len <= 1 {
             return 0;
@@ -108,7 +136,9 @@ impl FastPrp {
             return y;
         }
 
-        let c0 = self.cache.c0(&self.gen, d, alpha, len);
+        // c0(alpha, len): O(1) from partition cache when available.
+        let c0 = self.pcache.c0(d, alpha, len)
+            .unwrap_or_else(|| self.cache.c0(&self.gen, d, alpha, len));
 
         if y < c0 {
             let x_prime = self.unpermute_rec(y, alpha, c0, d + 1);
@@ -188,8 +218,15 @@ impl FastPrp {
                         Self::count_zeros_bulk(&part_blocks, base, gs, a, xi),
                         Self::count_zeros_bulk(&part_blocks, base, gs, a, l),
                     )
+                } else if let Some(c1_alpha) = self.pcache.cumulative_ones(d, a) {
+                    // Partition cache hit: c0_len free, c0_x needs 1 scan.
+                    let c1_end = self.pcache.cumulative_ones(d, a + l).unwrap();
+                    let c0_len = l - (c1_end - c1_alpha);
+                    let c1_ax = self.cache.cumulative_ones(&self.gen, d, a + xi);
+                    let c0_x = xi - (c1_ax - c1_alpha);
+                    (c0_x, c0_len)
                 } else {
-                    // Large partition: use cache with shared alpha scan.
+                    // Fall back to stride cache.
                     self.cache.c0_pair(&self.gen, d, a, xi, l)
                 };
 
