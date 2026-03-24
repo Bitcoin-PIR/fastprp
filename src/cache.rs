@@ -171,8 +171,11 @@ impl CounterCache {
         d < self.num_depths && !self.cache[d as usize].is_empty()
     }
 
-    /// Compute cumulative C1(β_d, 0, pos) using the stride cache + remainder scan.
-    /// Used when the partition cache provides c1_alpha but we still need c1(alpha+x).
+    /// Compute cumulative C1(β_d, 0, pos) using the stride cache.
+    ///
+    /// **Bidirectional scanning** (Section 4.1): picks the shorter direction
+    /// (forward from lower boundary or backward from upper boundary).
+    /// Average scan = s/2 instead of s.
     #[inline]
     pub fn cumulative_ones(&self, gen: &BitstringGen, d: u32, pos: u64) -> u64 {
         if pos == 0 { return 0; }
@@ -180,74 +183,47 @@ impl CounterCache {
             return gen.count_ones_range(d, 0, pos);
         }
         let s = self.stride;
-        let full = pos / s;
-        let cached = if full > 0 {
+        let full = pos / s; // pos is in stride block [full*s, (full+1)*s)
+        let lower_bound = full * s;
+        let forward_dist = pos - lower_bound;
+
+        if forward_dist == 0 {
+            // Exactly on a stride boundary.
+            return if full > 0 { self.get_cached(d, (full - 1) as usize) } else { 0 };
+        }
+
+        let lower_cached = if full > 0 {
             self.get_cached(d, (full - 1) as usize)
         } else {
             0
         };
-        let rem_start = full * s;
-        if rem_start < pos {
-            cached + gen.count_ones_range(d, rem_start, pos - rem_start)
-        } else {
-            cached
+
+        // Check if backward scan from the upper boundary is shorter.
+        let upper_idx = full as usize;
+        let cache_d = &self.cache[d as usize];
+        if upper_idx < cache_d.len() {
+            let upper_bound = (full + 1) * s;
+            let backward_dist = upper_bound - pos;
+            if backward_dist < forward_dist {
+                let upper_cached = cache_d[upper_idx] as u64;
+                let ones_after = gen.count_ones_range(d, pos, backward_dist);
+                return upper_cached - ones_after;
+            }
         }
+
+        // Forward scan.
+        lower_cached + gen.count_ones_range(d, lower_bound, forward_dist)
     }
 
     /// Compute C1(β_d, α, count) using cached values.
     /// Returns the number of 1-bits in β_d[α..α+count].
     pub fn c1(&self, gen: &BitstringGen, d: u32, alpha: u64, count: u64) -> u64 {
-        if count == 0 {
-            return 0;
-        }
-
+        if count == 0 { return 0; }
+        // For uncached depths, scan the range directly (avoid scanning from 0).
         if !self.is_depth_cached(d) {
             return gen.count_ones_range(d, alpha, count);
         }
-
-        let s = self.stride;
-        let end = alpha + count;
-
-        // Find the cached boundaries that bracket [alpha, end)
-        // cached[i] = C1(β_d, 0, s*(i+1))
-
-        // Cumulative ones from 0 to alpha
-        let ones_before_alpha = if alpha == 0 {
-            0
-        } else {
-            let full_strides_alpha = alpha / s;
-            let cached_alpha = if full_strides_alpha > 0 {
-                self.get_cached(d, (full_strides_alpha - 1) as usize)
-            } else {
-                0
-            };
-            let remainder_start = full_strides_alpha * s;
-            if remainder_start < alpha {
-                cached_alpha + gen.count_ones_range(d, remainder_start, alpha - remainder_start)
-            } else {
-                cached_alpha
-            }
-        };
-
-        // Cumulative ones from 0 to end
-        let ones_before_end = if end == 0 {
-            0
-        } else {
-            let full_strides_end = end / s;
-            let cached_end = if full_strides_end > 0 {
-                self.get_cached(d, (full_strides_end - 1) as usize)
-            } else {
-                0
-            };
-            let remainder_start = full_strides_end * s;
-            if remainder_start < end {
-                cached_end + gen.count_ones_range(d, remainder_start, end - remainder_start)
-            } else {
-                cached_end
-            }
-        };
-
-        ones_before_end - ones_before_alpha
+        self.cumulative_ones(gen, d, alpha + count) - self.cumulative_ones(gen, d, alpha)
     }
 
     /// Compute C0(β_d, α, count) using cached values.
@@ -256,8 +232,7 @@ impl CounterCache {
         count - self.c1(gen, d, alpha, count)
     }
 
-    /// Compute C0(β_d, α, x) and C0(β_d, α, len) in one call,
-    /// sharing the `ones_before_alpha` scan that both need.
+    /// Compute C0(β_d, α, x) and C0(β_d, α, len) in one call.
     /// Returns (c0_x, c0_len).
     pub fn c0_pair(&self, gen: &BitstringGen, d: u32, alpha: u64, x: u64, len: u64) -> (u64, u64) {
         if !self.is_depth_cached(d) {
@@ -266,64 +241,10 @@ impl CounterCache {
                 len - gen.count_ones_range(d, alpha, len),
             );
         }
-
-        let s = self.stride;
-
-        // Shared: ones_before_alpha — computed ONCE instead of twice.
-        let ones_before_alpha = if alpha == 0 {
-            0
-        } else {
-            let full = alpha / s;
-            let cached = if full > 0 {
-                self.get_cached(d, (full - 1) as usize)
-            } else {
-                0
-            };
-            let rem_start = full * s;
-            if rem_start < alpha {
-                cached + gen.count_ones_range(d, rem_start, alpha - rem_start)
-            } else {
-                cached
-            }
-        };
-
-        // ones_before(alpha + x)
-        let end_x = alpha + x;
-        let ones_before_end_x = {
-            let full = end_x / s;
-            let cached = if full > 0 {
-                self.get_cached(d, (full - 1) as usize)
-            } else {
-                0
-            };
-            let rem_start = full * s;
-            if rem_start < end_x {
-                cached + gen.count_ones_range(d, rem_start, end_x - rem_start)
-            } else {
-                cached
-            }
-        };
-
-        // ones_before(alpha + len)
-        let end_len = alpha + len;
-        let ones_before_end_len = {
-            let full = end_len / s;
-            let cached = if full > 0 {
-                self.get_cached(d, (full - 1) as usize)
-            } else {
-                0
-            };
-            let rem_start = full * s;
-            if rem_start < end_len {
-                cached + gen.count_ones_range(d, rem_start, end_len - rem_start)
-            } else {
-                cached
-            }
-        };
-
-        let c1_x = ones_before_end_x - ones_before_alpha;
-        let c1_len = ones_before_end_len - ones_before_alpha;
-        (x - c1_x, len - c1_len)
+        let ca = self.cumulative_ones(gen, d, alpha);
+        let cx = self.cumulative_ones(gen, d, alpha + x);
+        let cl = self.cumulative_ones(gen, d, alpha + len);
+        (x - (cx - ca), len - (cl - ca))
     }
 
     /// Find the k-th one bit (1-indexed) in β_d starting at position `alpha`.
@@ -334,25 +255,7 @@ impl CounterCache {
         }
 
         let s = self.stride;
-
-        // We need C1(β_d, 0, alpha) to convert to absolute
-        let ones_before_alpha = if alpha == 0 {
-            0
-        } else {
-            let full = alpha / s;
-            let cached = if full > 0 {
-                self.get_cached(d, (full - 1) as usize)
-            } else {
-                0
-            };
-            let rem_start = full * s;
-            if rem_start < alpha {
-                cached + gen.count_ones_range(d, rem_start, alpha - rem_start)
-            } else {
-                cached
-            }
-        };
-
+        let ones_before_alpha = self.cumulative_ones(gen, d, alpha);
         let target = ones_before_alpha + k;
 
         // Binary search in cache for the stride containing the target-th one
@@ -390,27 +293,7 @@ impl CounterCache {
         }
 
         let s = self.stride;
-
-        // Count zeros before alpha
-        let zeros_before_alpha = if alpha == 0 {
-            0
-        } else {
-            alpha - {
-                let full = alpha / s;
-                let cached = if full > 0 {
-                    self.get_cached(d, (full - 1) as usize)
-                } else {
-                    0
-                };
-                let rem_start = full * s;
-                if rem_start < alpha {
-                    cached + gen.count_ones_range(d, rem_start, alpha - rem_start)
-                } else {
-                    cached
-                }
-            }
-        };
-
+        let zeros_before_alpha = alpha - self.cumulative_ones(gen, d, alpha);
         let target_zeros = zeros_before_alpha + k;
 
         // Binary search: find the stride block where the target-th zero is
