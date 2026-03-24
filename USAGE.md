@@ -5,7 +5,9 @@ Permutations for Small Domains."  Provides bijective, key-controlled
 permutations over arbitrary domains {0, 1, ..., N-1} with efficient
 single-element lookup (no need to materialise the full table).
 
-## Quick start
+Available as a **Rust library** and a **WASM module** for browser/Node.js.
+
+## Quick start (Rust)
 
 ```toml
 # Cargo.toml
@@ -28,19 +30,54 @@ let x = prp.unpermute(y);      // y   -> 42
 assert_eq!(x, 42);
 ```
 
-## API reference
+## Quick start (WASM / JavaScript)
+
+```bash
+# Build the WASM package
+wasm-pack build --target web --features wasm    # for browsers
+wasm-pack build --target nodejs --features wasm  # for Node.js
+```
+
+```js
+import init, { WasmFastPrp } from './pkg/fastprp.js';
+await init();
+
+const key = new Uint8Array(16); // 128-bit AES key
+const n = 1_000_000;
+
+// Build from scratch (builds caches from key)
+const prp = new WasmFastPrp(key, n);
+
+const y = prp.permute(42);     // 42  -> some y in [0, N)
+const x = prp.unpermute(y);    // y   -> 42
+console.assert(x === 42);
+
+// Export cache for server→client transfer
+const cacheBytes = prp.exportCacheBytes();  // Uint8Array
+
+// Client: load from server-provided cache
+const prp2 = WasmFastPrp.fromCacheBytes(key, n, cacheBytes);
+
+// Client: refine cache locally for faster lookups
+prp2.refineTo(2048);  // halve stride until ≤ 2048
+
+prp.free();   // release WASM memory when done
+prp2.free();
+```
+
+## Rust API reference
 
 ### Construction
 
 ```rust
 // Default cache stride  s = 2*sqrt(N).
-// Cache memory ≈ O(N / s * log N) ≈ O(sqrt(N) * log N).
 let prp = FastPrp::new(key: &[u8; 16], n: u64) -> FastPrp;
 
 // Custom stride — smaller stride = more cache memory, faster per-lookup.
-//   stride = sqrt(N)/4  →  ~3.7 MB cache, ~2x faster lookups
-//   stride = 2*sqrt(N)  →  ~400 KB cache  (default)
 let prp = FastPrp::with_stride(key: &[u8; 16], n: u64, stride: u64) -> FastPrp;
+
+// Reconstruct from pre-built caches (for cache persistence / transfer).
+let prp = FastPrp::from_parts(key: &[u8; 16], n: u64, cache: CounterCache, pcache: PartitionCache);
 ```
 
 `FastPrp` is `Sync + Send` — a single instance can be shared across threads
@@ -62,29 +99,8 @@ allocation per call.  Thread-safe (`&self`).
 prp.permute_4(inputs: [u64; 4]) -> [u64; 4]
 ```
 
-Processes 4 independent permutations with:
-- Pipelined AES bit-lookups (4 blocks encrypted in one `encrypt_blocks` call)
-- Shared `ones_before_alpha` scan across the two C0 queries per element (25%
-  fewer AES blocks than 4x individual `permute`)
-- Small-partition optimisation: when the partition shrinks below `2 * stride`,
-  precomputes AES blocks for the range and answers C0 queries from the buffer
-
-**Recommended pattern for many lookups:**
-
-```rust
-use rayon::prelude::*;
-
-let inputs: Vec<u64> = (0..16384).collect();
-let results: Vec<u64> = inputs
-    .par_chunks(4)
-    .flat_map(|chunk| {
-        let mut batch = [0u64; 4];
-        for (i, &v) in chunk.iter().enumerate() { batch[i] = v; }
-        let out = prp.permute_4(batch);
-        out[..chunk.len()].to_vec()
-    })
-    .collect();
-```
+Processes 4 independent permutations with pipelined AES bit-lookups and
+shared partition-cache scans.
 
 ### Full-domain batch permute
 
@@ -93,12 +109,22 @@ prp.batch_permute() -> Vec<u64>
 ```
 
 Returns a table where `result[x] = permute(x)` for all x in {0, ..., N-1}.
-Uses the Section 3.2 radix-sort view: level-by-level stable partitioning with
-bulk AES generation, branchless writes, u32 internal arrays, and double
-buffering.  O(N log N) time, O(N) memory.
+O(N log N) time, O(N) memory. Single-threaded (depth d+1 depends on d).
 
-**This is inherently single-threaded** — depth d+1 depends on depth d.
-Parallelising the scattered writes makes it *slower* due to cache contention.
+### Incremental caching (Section 5.3)
+
+```rust
+// Build coarse cache (small, fast)
+let mut cache = CounterCache::new(&gen, coarse_stride);
+
+// Refine locally — each step halves the stride
+cache.refine(&gen);              // one step
+cache.refine_to(&gen, 2048);     // refine until stride ≤ 2048
+
+// Cache serialization for transfer
+let raw = cache.raw_cache();     // serialize
+let cache = CounterCache::from_raw(stride, num_depths, n, raw);  // deserialize
+```
 
 ### Inspecting the instance
 
@@ -108,14 +134,85 @@ prp.cache_stride()    -> u64    // s
 prp.cache_size_bytes() -> usize // total cache memory
 ```
 
+## WASM API reference
+
+### Construction
+
+```js
+// Build from scratch (both caches built from key)
+const prp = new WasmFastPrp(key_u8, n);
+
+// Custom stride
+const prp = WasmFastPrp.withStride(key_u8, n, stride);
+
+// Load from pre-serialized cache bytes (server → client transfer)
+const prp = WasmFastPrp.fromCacheBytes(key_u8, n, cacheBytes_u8);
+```
+
+### Operations
+
+```js
+prp.permute(x)                    // forward PRP: x → y
+prp.unpermute(y)                  // inverse PRP: y → x
+prp.permute4(x0, x1, x2, x3)     // returns Float64Array(4)
+prp.batchPermute()                // returns Float64Array(N)
+```
+
+### Incremental caching
+
+```js
+prp.refine()                      // halve stride once
+prp.refineTo(targetStride)        // refine until stride ≤ target
+```
+
+### Cache transfer
+
+```js
+const bytes = prp.exportCacheBytes()  // Uint8Array — send to client
+const prp = WasmFastPrp.fromCacheBytes(key, n, bytes)  // client loads
+```
+
+### Getters
+
+```js
+prp.domainSize      // N
+prp.cacheStride     // current stride
+prp.cacheSizeBytes  // cache memory in bytes
+```
+
 ## Recommended patterns
 
-### Many ad-hoc lookups (different keys)
+### Server → client workflow (PIR)
 
-Use `permute()` / `unpermute()` directly.  Each `FastPrp::new()` builds
-the counter cache in O(N / stride * log N) time.  For N = 2^27 with
-default stride this takes ~4 seconds; with `stride = sqrt(N)/4` it takes
-~15 seconds but per-lookup drops from ~300 us to ~100 us.
+1. **Server** builds FastPrp with desired stride, exports cache:
+   ```rust
+   let prp = FastPrp::with_stride(&key, n, stride);
+   let bytes = serialize(prp.counter_cache(), prp.partition_cache());
+   // Send key + bytes to client
+   ```
+
+2. **Client** (browser, WASM) loads cache and optionally refines:
+   ```js
+   const prp = WasmFastPrp.fromCacheBytes(key, n, serverBytes);
+   prp.refineTo(2048);  // optional: expand cache for faster lookups
+   const y = prp.permute(x);
+   const x = prp.unpermute(y);
+   ```
+
+### Cache stride vs query count tradeoff (N = 2^21)
+
+For a fixed workload of ~2,048 PRP calls (1024 forward + 1024 inverse):
+
+| Stride | Cache | Init time | 2048 queries | Init + queries |
+|--------|-------|-----------|-------------|----------------|
+| 8√N | 9 KB | 40 ms | 70 ms | **110 ms** |
+| 4√N | 20 KB | 52 ms | 56 ms | **108 ms** |
+| 2√N [default] | 42 KB | 71 ms | 47 ms | **118 ms** |
+| √N | 90 KB | 90 ms | 40 ms | **130 ms** |
+| √N/4 | 407 KB | 214 ms | 32 ms | **246 ms** |
+
+Sweet spot for ~2K queries: **stride = 4√N–8√N** (~108 ms total).
+For >8K queries, smaller strides pay for themselves.
 
 ### Offline full-table generation (one key, all N elements)
 
@@ -140,43 +237,43 @@ let tables: Vec<Vec<u64>> = (0..num_buckets)
     .collect();
 ```
 
-Typical performance at N = 2^27 total:
+Typical performance at N = 2^27 total (Apple M-series, 24 cores):
 
-| Buckets | Bucket size | Wall-clock (24 cores) |
-|---------|-------------|-----------------------|
-| 80      | 1.68M       | 1.0 s                 |
-| 200     | 671K        | 0.85 s                |
-| 400     | 336K        | 0.72 s                |
+| Buckets | Bucket size | Wall-clock |
+|---------|-------------|------------|
+| 80 | 1.68M | 1.0 s |
+| 200 | 671K | 0.85 s |
+| 400 | 336K | 0.72 s |
 
-Sweet spot: bucket working set fits in L2 cache (~300K–700K elements).
+## Performance reference
 
-### Streaming the result
+### Native (Apple M-series, single core, default stride 2√N)
 
-`batch_permute()` returns `result[x] = y`.  To iterate in *output* order
-(position 0, 1, 2, ...) you need the inverse table:
+| N | `new()` | `permute()` | `unpermute()` | `batch_permute()` |
+|-------|---------|-------------|---------------|-------------------|
+| 2^14 | <1 ms | 9 us | 9 us | ~1 ms |
+| 2^20 | ~40 ms | 21 us | 13 us | ~87 ms |
+| 2^21 | ~70 ms | 28 us | 19 us | ~250 ms |
+| 2^23 | ~300 ms | 38 us | 26 us | ~1.8 s |
+| 2^27 | ~3 s | 82 us | 63 us | ~14.7 s |
 
-```rust
-let fwd = prp.batch_permute();          // fwd[x] = y
-let mut inv = vec![0u64; fwd.len()];    // inv[y] = x
-for (x, &y) in fwd.iter().enumerate() {
-    inv[y as usize] = x as u64;
-}
-// Now inv[0], inv[1], ... gives the element at each output position.
-```
+### WASM (Node.js V8)
 
-## Performance reference (Apple M-series, single core)
+| N | `permute()` | `unpermute()` | overhead vs native |
+|-------|-------------|---------------|--------------------|
+| 2^14 | 8 us | 9 us | ~1x |
+| 2^20 | 20 us | 18 us | ~1x |
+| 2^23 | 40 us | 34 us | ~1.05x |
 
-| N     | `new()` | `permute()` | `permute_4()` | `batch_permute()` |
-|-------|---------|-------------|----------------|-------------------|
-| 2^14  | <1 ms   | ~8 us       | ~27 us (4 elem)| ~1 ms             |
-| 2^20  | ~60 ms  | ~53 us      | ~180 us        | ~87 ms            |
-| 2^27  | ~4 s    | ~297 us     | ~1.1 ms        | ~14.7 s           |
+### WASM (Chrome browser)
 
-With `stride = sqrt(N)/4` (larger cache):
+| N | `permute()` | `unpermute()` | overhead vs native |
+|-------|-------------|---------------|--------------------|
+| 2^14 | 18 us | 20 us | ~2x |
+| 2^20 | 42 us | 39 us | ~2x |
+| 2^23 | 84 us | 76 us | ~2.2x |
 
-| N     | `new()` | `permute()` | Cache size |
-|-------|---------|-------------|------------|
-| 2^27  | ~15 s   | ~107 us     | 3.7 MB     |
+WASM package size: **60 KB**.
 
 ## Security
 
