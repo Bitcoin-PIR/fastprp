@@ -18,6 +18,9 @@ default = []
 wasm = ["wasm-bindgen", "js-sys"]
 
 [dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 rayon = "1.10"
 

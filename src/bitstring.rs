@@ -1,5 +1,12 @@
+use aes::Block;
+
+#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
 use aes::cipher::{BlockEncrypt, KeyInit};
-use aes::{Aes128, Block};
+#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+use aes::Aes128;
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+use crate::aes_wasm_simd::SimdAes128;
 
 /// AES-based pseudo-random bitstring generator.
 ///
@@ -7,13 +14,19 @@ use aes::{Aes128, Block};
 /// Bitstring β_d is the d-th chunk of N bits from this stream.
 /// β_d[i] is bit i of the d-th bitstring.
 pub struct BitstringGen {
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
     cipher: Aes128,
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    cipher: SimdAes128,
     n: u64,
 }
 
 impl BitstringGen {
     pub fn new(key: &[u8; 16], n: u64) -> Self {
+        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
         let cipher = Aes128::new(key.into());
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        let cipher = SimdAes128::new(key);
         Self { cipher, n }
     }
 
